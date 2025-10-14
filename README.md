@@ -61,7 +61,7 @@ Environment variables:
 - `REDIS_PASSWORD`: Redis password (default empty).
 - `REDIS_DB`: Redis database index (default `0`).
 - `SANDBOX_CONTAINER`: Name of the persistent execution container (default `code-sandbox-runner`).
-- `SANDBOX_JOB_DIR`: Host directory used for job files (default `/tmp/jobs`).
+- `SANDBOX_JOB_DIR`: Host dd used for job files (default `/tmp/jobs`).
 - `SANDBOX_TIMEOUT`: Maximum wall-clock runtime per job (default `3s`).
 - `SANDBOX_DOCKER_BIN`: Docker CLI binary to invoke (default `docker`).
 - `SANDBOX_NETWORK`: Optional Docker network to attach when exec'ing (default empty).
@@ -77,6 +77,6 @@ go test ./...
 
 ## Next Steps
 
-- Replace the in-memory execution simulation with real sandbox backends.
+- Harden sandbox isolation (cgroups, seccomp) and monitor runtime resource usage.
 - Instrument the service with structured logging and tracing.
 - Wire up CI and automation.
