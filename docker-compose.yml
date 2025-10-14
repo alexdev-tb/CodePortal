@@ -1,21 +1,48 @@
+x-runner-go: &runner-go
+  build:
+    context: ./docker/runner
+    dockerfile: go.Dockerfile
+  restart: unless-stopped
+  read_only: true
+  tty: true
+  stdin_open: true
+  security_opt:
+    - no-new-privileges:true
+  volumes:
+    - /tmp/jobs:/tmp/jobs:rw
+  labels:
+    sandbox.language: go
+  tmpfs:
+    - /tmp/go-build
+    - /tmp/go-mod
+
+x-runner-python: &runner-python
+  build:
+    context: ./docker/runner
+    dockerfile: python.Dockerfile
+  restart: unless-stopped
+  read_only: true
+  tty: true
+  stdin_open: true
+  security_opt:
+    - no-new-privileges:true
+  volumes:
+    - /tmp/jobs:/tmp/jobs:rw
+  labels:
+    sandbox.language: python
+
 services:
-  runner:
-    build:
-      context: ./docker/runner
-    container_name: code-sandbox-runner
-    restart: unless-stopped
-    read_only: true
-    tty: true
-    stdin_open: true
-    security_opt:
-      - no-new-privileges:true
+  runner-go-1:
+    <<: *runner-go
+    container_name: code-sandbox-runner-go-1
 
-    volumes:
-      - /tmp/jobs:/tmp/jobs:rw
+  runner-go-2:
+    <<: *runner-go
+    container_name: code-sandbox-runner-go-2
 
-    tmpfs:
-      - /tmp/go-build
-      - /tmp/go-mod
+  runner-python-1:
+    <<: *runner-python
+    container_name: code-sandbox-runner-python-1
 
   redis:
     image: redis:7.2-alpine
