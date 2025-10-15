@@ -31,6 +31,21 @@ x-runner-python: &runner-python
   labels:
     sandbox.language: python
 
+x-runner-node: &runner-node
+  build:
+    context: ./docker/runner
+    dockerfile: node.Dockerfile
+  restart: unless-stopped
+  read_only: true
+  tty: true
+  stdin_open: true
+  security_opt:
+    - no-new-privileges:true
+  volumes:
+    - /tmp/jobs:/tmp/jobs:rw
+  labels:
+    sandbox.language: node
+
 services:
   runner-go-1:
     <<: *runner-go
@@ -43,6 +58,18 @@ services:
   runner-python-1:
     <<: *runner-python
     container_name: code-sandbox-runner-python-1
+
+  runner-python-2:
+    <<: *runner-python
+    container_name: code-sandbox-runner-python-2
+
+  runner-node-1:
+    <<: *runner-node
+    container_name: code-sandbox-runner-node-1
+
+  runner-node-2:
+    <<: *runner-node
+    container_name: code-sandbox-runner-node-2
 
   redis:
     image: redis:7.2-alpine

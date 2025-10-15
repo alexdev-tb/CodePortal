@@ -128,6 +128,33 @@ func TestExecuteWithStdin(t *testing.T) {
 	}
 }
 
+func TestExecuteJavaScript(t *testing.T) {
+	exec := &stubExecutor{
+		submitJob: executor.Job{
+			ID:        "job-js",
+			Status:    executor.StatusQueued,
+			CreatedAt: time.Unix(0, 0).UTC(),
+		},
+	}
+
+	h := NewHandler(exec)
+
+	payload := ExecuteRequest{Language: "javascript", Code: "console.log('hi')"}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/execute", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Execute(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected %d, got %d", http.StatusAccepted, rec.Code)
+	}
+}
+
 func TestExecuteUnsupportedLanguage(t *testing.T) {
 	h := NewHandler(&stubExecutor{})
 

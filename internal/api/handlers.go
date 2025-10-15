@@ -154,7 +154,7 @@ func validateExecuteRequest(req ExecuteRequest) error {
 	}
 
 	switch strings.ToLower(req.Language) {
-	case "go", "python":
+	case "go", "golang", "python", "py", "javascript", "js", "node", "nodejs":
 		return nil
 	default:
 		return ErrUnsupportedLanguage

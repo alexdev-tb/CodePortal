@@ -67,6 +67,26 @@ type languageSpec struct {
 	args      []string
 }
 
+var languageAliases = map[string]string{
+	"go":         "go",
+	"golang":     "go",
+	"python":     "python",
+	"py":         "python",
+	"node":       "node",
+	"nodejs":     "node",
+	"javascript": "node",
+	"js":         "node",
+}
+
+func canonicalLanguageName(lang string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(lang))
+	if trimmed == "" {
+		return "", false
+	}
+	canonical, ok := languageAliases[trimmed]
+	return canonical, ok
+}
+
 func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 	container := strings.TrimSpace(cfg.Container)
 
@@ -147,6 +167,10 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 				extension: "py",
 				args:      []string{"python3"},
 			},
+			"node": {
+				extension: "js",
+				args:      []string{"node"},
+			},
 		},
 		pools:    pools,
 		fallback: fallbackPool,
@@ -160,14 +184,19 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 }
 
 func (r *DockerRunner) Run(ctx context.Context, jobID string, req Request, timeout time.Duration) (Result, error) {
-	language := strings.ToLower(strings.TrimSpace(req.Language))
-	spec, ok := r.languages[language]
+	canonical, ok := canonicalLanguageName(req.Language)
 	if !ok {
 		now := time.Now().UTC()
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("unsupported language %q", req.Language)
 	}
 
-	pool := r.pools[language]
+	spec, ok := r.languages[canonical]
+	if !ok {
+		now := time.Now().UTC()
+		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("unsupported language %q", req.Language)
+	}
+
+	pool := r.pools[canonical]
 	if pool == nil {
 		pool = r.fallback
 	}
@@ -176,7 +205,7 @@ func (r *DockerRunner) Run(ctx context.Context, jobID string, req Request, timeo
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("no containers configured for language %q", req.Language)
 	}
 
-	containerName, err := r.acquireContainer(ctx, pool, language, jobID)
+	containerName, err := r.acquireContainer(ctx, pool, canonical, jobID)
 	if err != nil {
 		now := time.Now().UTC()
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -189,9 +218,9 @@ func (r *DockerRunner) Run(ctx context.Context, jobID string, req Request, timeo
 	}
 	defer func() {
 		if released := pool.release(containerName); released {
-			log.Printf("%s[RELEASE]%s job %s (%s) released container %s (%d/%d available)", colorCyan, colorReset, jobID, language, containerName, pool.availableCount(), pool.capacity())
+			log.Printf("%s[RELEASE]%s job %s (%s) released container %s (%d/%d available)", colorCyan, colorReset, jobID, canonical, containerName, pool.availableCount(), pool.capacity())
 		} else {
-			log.Printf("%s[WARN]%s job %s (%s) release dropped for container %s", colorYellow, colorReset, jobID, language, containerName)
+			log.Printf("%s[WARN]%s job %s (%s) release dropped for container %s", colorYellow, colorReset, jobID, canonical, containerName)
 		}
 	}()
 
@@ -254,7 +283,7 @@ func (r *DockerRunner) Run(ctx context.Context, jobID string, req Request, timeo
 	envVars := []string{
 		fmt.Sprintf("TMPDIR=%s", tmpDir),
 	}
-	if language == "go" {
+	if canonical == "go" {
 		envVars = append(envVars,
 			fmt.Sprintf("GOCACHE=%s", cacheDir),
 			fmt.Sprintf("GOMODCACHE=%s", modCacheDir),
@@ -262,7 +291,7 @@ func (r *DockerRunner) Run(ctx context.Context, jobID string, req Request, timeo
 			"GO111MODULE=off",
 		)
 	}
-	if language == "python" {
+	if canonical == "python" {
 		envVars = append(envVars,
 			fmt.Sprintf("PYTHONPYCACHEPREFIX=%s", pyCacheDir),
 		)
@@ -429,15 +458,16 @@ func normalizeLanguageMap(in map[string][]string) map[string][]string {
 	}
 	out := make(map[string][]string)
 	for lang, names := range in {
-		lowerLang := strings.ToLower(strings.TrimSpace(lang))
-		if lowerLang == "" {
+		canonical, ok := canonicalLanguageName(lang)
+		if !ok {
 			continue
 		}
-		cleaned := dedupeNames(names)
+		combined := append(out[canonical], names...)
+		cleaned := dedupeNames(combined)
 		if len(cleaned) == 0 {
 			continue
 		}
-		out[lowerLang] = cleaned
+		out[canonical] = cleaned
 	}
 	return out
 }
@@ -462,8 +492,8 @@ func detectContainerPools(dockerBin string) (map[string][]string, error) {
 			continue
 		}
 
-		lang := strings.ToLower(strings.TrimSpace(parts[0]))
-		if lang == "" {
+		lang, ok := canonicalLanguageName(parts[0])
+		if !ok {
 			continue
 		}
 

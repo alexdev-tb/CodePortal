@@ -56,3 +56,23 @@ func TestSelectFallbackContainer(t *testing.T) {
 		t.Fatalf("expected empty fallback for nil map")
 	}
 }
+
+func TestNormalizeLanguageMapAliases(t *testing.T) {
+	mapped := normalizeLanguageMap(map[string][]string{
+		"JavaScript": {"node-1"},
+		"nodejs":     {"node-2"},
+		"GoLang":     {"go-1"},
+	})
+
+	nodeNames, ok := mapped["node"]
+	if !ok {
+		t.Fatalf("expected node language to be present")
+	}
+	if len(nodeNames) != 2 {
+		t.Fatalf("expected 2 node containers, got %d", len(nodeNames))
+	}
+
+	if _, ok := mapped["golang"]; ok {
+		t.Fatalf("expected canonical key only")
+	}
+}
