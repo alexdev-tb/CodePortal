@@ -80,6 +80,10 @@ func logPoolDetails(snapshots []executor.PoolSnapshot) {
 		if snap.Fallback {
 			label = "fallback"
 		}
-		log.Printf("%s[BOOT]%s %-9s containers=%v total=%d available=%d", colorCyan, colorReset, label, snap.Containers, snap.Total, snap.Available)
+		log.Printf("%s[BOOT]%s %-9s containers=%v total=%d available=%d limits=%s", colorCyan, colorReset, label, snap.Containers, snap.Total, snap.Available, formatLimits(snap.Limits))
 	}
+}
+
+func formatLimits(l executor.ContainerLimits) string {
+	return executor.FormatLimits(l)
 }
