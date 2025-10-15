@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +41,10 @@ type DockerRunner struct {
 	limitsMu        sync.RWMutex
 	dead            map[string]struct{}
 	deadMu          sync.RWMutex
+	prewarming      map[string]struct{}
+	prewarmMu       sync.RWMutex
+	prewarmGate     atomic.Bool
+	discoveryGate   atomic.Bool
 	discoveryCancel context.CancelFunc
 }
 
@@ -281,11 +286,12 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 				args:      []string{"node"},
 			},
 		},
-		pools:    pools,
-		fallback: fallbackPool,
-		cleanupQ: make(chan cleanupRequest, cleanupQueueSize),
-		limits:   make(map[string]ContainerLimits),
-		dead:     make(map[string]struct{}),
+		pools:      pools,
+		fallback:   fallbackPool,
+		cleanupQ:   make(chan cleanupRequest, cleanupQueueSize),
+		limits:     make(map[string]ContainerLimits),
+		dead:       make(map[string]struct{}),
+		prewarming: make(map[string]struct{}),
 	}
 
 	for _, pool := range pools {
@@ -580,6 +586,16 @@ func (r *DockerRunner) acquireContainer(ctx context.Context, pool *containerPool
 			r.disableContainer(pool, trimmed)
 			continue
 		}
+		if r.isContainerPrewarming(trimmed) {
+			if released := pool.release(trimmed); !released {
+				log.Printf("%s[WARN]%s job %s (%s) dropped prewarming container %s during assignment", colorYellow, colorReset, jobID, language, trimmed)
+			}
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
 		remaining := pool.availableCount()
 		log.Printf("%s[RUN]%s job %s (%s) assigned to container %s (%d/%d available)", colorGreen, colorReset, jobID, language, trimmed, remaining, total)
 		return trimmed, nil
@@ -764,12 +780,23 @@ func (r *DockerRunner) recoverContainer(containerName, language string, pool *co
 
 func (r *DockerRunner) startPrewarmLoop() {
 	go func() {
-		r.prewarmAll()
+		r.triggerPrewarm()
 		ticker := time.NewTicker(prewarmInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			r.prewarmAll()
+			r.triggerPrewarm()
 		}
+	}()
+}
+
+func (r *DockerRunner) triggerPrewarm() {
+	if !r.prewarmGate.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer r.prewarmGate.Store(false)
+		r.prewarmAll()
 	}()
 }
 
@@ -780,7 +807,7 @@ func (r *DockerRunner) startDiscoveryLoop() {
 }
 
 func (r *DockerRunner) discoveryLoop(ctx context.Context) {
-	r.refreshDiscoveredPools()
+	r.triggerDiscovery()
 	ticker := time.NewTicker(discoveryInterval)
 	defer ticker.Stop()
 	for {
@@ -788,9 +815,20 @@ func (r *DockerRunner) discoveryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.refreshDiscoveredPools()
+			r.triggerDiscovery()
 		}
 	}
+}
+
+func (r *DockerRunner) triggerDiscovery() {
+	if !r.discoveryGate.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer r.discoveryGate.Store(false)
+		r.refreshDiscoveredPools()
+	}()
 }
 
 func (r *DockerRunner) refreshDiscoveredPools() {
@@ -815,6 +853,9 @@ func (r *DockerRunner) refreshDiscoveredPools() {
 				r.pools[lang] = pool
 				log.Printf("%s[DISCOVER]%s registered new pool for %s (%d container(s))", colorMagenta, colorReset, lang, len(names))
 				r.captureContainerLimits(names)
+				for _, name := range names {
+					r.markContainerAlive(name)
+				}
 			}
 			continue
 		}
@@ -858,6 +899,7 @@ func (r *DockerRunner) disableMissingContainers(current map[string][]string) {
 			}
 			if pool.disable(trimmed) {
 				r.markContainerDead(trimmed)
+				r.finishPrewarm(trimmed)
 				r.limitsMu.Lock()
 				delete(r.limits, trimmed)
 				r.limitsMu.Unlock()
@@ -878,6 +920,7 @@ func (r *DockerRunner) disableMissingContainers(current map[string][]string) {
 			}
 			if r.fallback.disable(trimmed) {
 				r.markContainerDead(trimmed)
+				r.finishPrewarm(trimmed)
 				r.limitsMu.Lock()
 				delete(r.limits, trimmed)
 				r.limitsMu.Unlock()
@@ -889,19 +932,76 @@ func (r *DockerRunner) disableMissingContainers(current map[string][]string) {
 
 func (r *DockerRunner) prewarmAll() {
 	names := r.allContainerNames()
+	if len(names) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
 	for _, name := range names {
 		if r.isContainerDead(name) {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), prewarmTimeout)
-		if err := r.ensureContainer(ctx, name); err != nil {
-			log.Printf("%s[WARN]%s prewarm ensure failed for container %s: %v", colorYellow, colorReset, name, err)
-			cancel()
+		if !r.beginPrewarm(name) {
 			continue
 		}
-		r.markContainerAlive(name)
-		cancel()
+		wg.Add(1)
+		go func(containerName string) {
+			defer wg.Done()
+			r.prewarmContainer(containerName)
+		}(name)
 	}
+
+	wg.Wait()
+}
+
+func (r *DockerRunner) beginPrewarm(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+
+	r.prewarmMu.Lock()
+	defer r.prewarmMu.Unlock()
+	if _, exists := r.prewarming[trimmed]; exists {
+		return false
+	}
+	r.prewarming[trimmed] = struct{}{}
+	return true
+}
+
+func (r *DockerRunner) finishPrewarm(name string) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return
+	}
+	r.prewarmMu.Lock()
+	delete(r.prewarming, trimmed)
+	r.prewarmMu.Unlock()
+}
+
+func (r *DockerRunner) isContainerPrewarming(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+	r.prewarmMu.RLock()
+	_, ok := r.prewarming[trimmed]
+	r.prewarmMu.RUnlock()
+	return ok
+}
+
+func (r *DockerRunner) prewarmContainer(name string) {
+	defer r.finishPrewarm(name)
+
+	ctx, cancel := context.WithTimeout(context.Background(), prewarmTimeout)
+	defer cancel()
+
+	if err := r.ensureContainer(ctx, name); err != nil {
+		log.Printf("%s[WARN]%s prewarm ensure failed for container %s: %v", colorYellow, colorReset, name, err)
+		return
+	}
+
+	r.markContainerAlive(name)
 }
 
 func (r *DockerRunner) allContainerNames() []string {
@@ -1376,6 +1476,7 @@ func (r *DockerRunner) disableContainer(pool *containerPool, name string) {
 		log.Printf("%s[WARN]%s disabled container %s", colorYellow, colorReset, trimmed)
 	}
 	r.markContainerDead(trimmed)
+	r.finishPrewarm(trimmed)
 	r.limitsMu.Lock()
 	delete(r.limits, trimmed)
 	r.limitsMu.Unlock()

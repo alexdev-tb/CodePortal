@@ -160,6 +160,7 @@ func (p *containerPool) add(names ...string) int {
 				select {
 				case p.available <- name:
 					p.slots.Add(1)
+					added++
 				default:
 				}
 			}
