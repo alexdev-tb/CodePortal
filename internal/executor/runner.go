@@ -46,6 +46,8 @@ type DockerRunner struct {
 	discoveryCancel context.CancelFunc
 	overheadStats   map[string]*overheadTracker
 	overheadMu      sync.RWMutex
+	prewarmState    map[string]*prewarmStatus
+	prewarmStateMu  sync.Mutex
 }
 
 const (
@@ -196,6 +198,7 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 		dead:          make(map[string]struct{}),
 		prewarming:    make(map[string]struct{}),
 		overheadStats: make(map[string]*overheadTracker),
+		prewarmState:  make(map[string]*prewarmStatus),
 	}
 
 	for _, pool := range pools {
@@ -782,6 +785,7 @@ func (r *DockerRunner) disableMissingContainers(current map[string][]string) {
 			if pool.disable(trimmed) {
 				r.markContainerDead(trimmed)
 				r.finishPrewarm(trimmed)
+				r.clearPrewarmState(trimmed)
 				r.limitsMu.Lock()
 				delete(r.limits, trimmed)
 				r.limitsMu.Unlock()
@@ -803,6 +807,7 @@ func (r *DockerRunner) disableMissingContainers(current map[string][]string) {
 			if r.fallback.disable(trimmed) {
 				r.markContainerDead(trimmed)
 				r.finishPrewarm(trimmed)
+				r.clearPrewarmState(trimmed)
 				r.limitsMu.Lock()
 				delete(r.limits, trimmed)
 				r.limitsMu.Unlock()
@@ -1007,6 +1012,7 @@ func (r *DockerRunner) disableContainer(pool *containerPool, name string) {
 	}
 	r.markContainerDead(trimmed)
 	r.finishPrewarm(trimmed)
+	r.clearPrewarmState(trimmed)
 	r.limitsMu.Lock()
 	delete(r.limits, trimmed)
 	r.limitsMu.Unlock()
