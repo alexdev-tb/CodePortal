@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
 	"os"
 	"os/signal"
@@ -10,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/alexdev-tb/CodePortal/internal/api"
+	"github.com/alexdev-tb/CodePortal/internal/auth"
 	"github.com/alexdev-tb/CodePortal/internal/config"
 	"github.com/alexdev-tb/CodePortal/internal/executor"
 	"github.com/alexdev-tb/CodePortal/internal/server"
@@ -28,6 +30,7 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
+	// Connect to Redis
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,
 		Password: cfg.Redis.Password,
@@ -39,6 +42,25 @@ func main() {
 		log.Fatalf("failed to connect to redis: %v", err)
 	}
 
+	// Connect to PostgreSQL
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://codeportal:codeportal-dev@localhost:5432/codeportal_accounts?sslmode=disable"
+		log.Printf("%s[DB]%s using default database URL (set DATABASE_URL env var for production)", colorYellow, colorReset)
+	}
+
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	// Test database connection
+	if err := db.Ping(); err != nil {
+		log.Fatalf("failed to ping database: %v", err)
+	}
+
+	// Set up execution service
 	store := executor.NewRedisJobStore(rdb)
 	runner := executor.NewDockerRunner(executor.RunnerConfig{
 		Container:          cfg.Sandbox.Container,
@@ -50,13 +72,32 @@ func main() {
 	})
 	logPoolDetails(runner.PoolSnapshots())
 	execService := executor.NewService(store, runner, cfg.Sandbox.Timeout)
-	handlers := api.NewHandler(execService)
-	router := api.NewRouter(handlers)
+	
+	// Set up authentication service with PostgreSQL
+	userStore, err := auth.NewPostgresStore(db)
+	if err != nil {
+		log.Fatalf("failed to initialize user store: %v", err)
+	}
+	
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "development-secret-key-change-in-production"
+		log.Printf("%s[AUTH]%s using default JWT secret (change JWT_SECRET env var for production)", colorYellow, colorReset)
+	}
+	authService := auth.NewService(userStore, jwtSecret)
+	
+	// Set up handlers
+	apiHandlers := api.NewHandler(execService)
+	authHandlers := auth.NewHandler(authService)
+	router := api.NewRouter(apiHandlers, authHandlers)
 
 	srv := server.New(cfg.HTTP, router)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	log.Printf("%s[AUTH]%s authentication service initialized with PostgreSQL", colorCyan, colorReset)
+	log.Printf("%s[DB]%s database connection established", colorCyan, colorReset)
 
 	if err := srv.Run(ctx); err != nil {
 		if err == server.ErrServerClosed {
