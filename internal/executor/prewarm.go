@@ -31,7 +31,7 @@ func (r *DockerRunner) triggerPrewarm() {
 
 	go func() {
 		defer r.prewarmGate.Store(false)
-		log.Printf("%s[PREWARM]%s initiating prewarm scan", colorCyan, colorReset)
+		// log.Printf("%s[PREWARM]%s initiating prewarm scan", colorCyan, colorReset)
 		r.prewarmAll()
 	}()
 }

@@ -44,6 +44,8 @@ type DockerRunner struct {
 	prewarmGate     atomic.Bool
 	discoveryGate   atomic.Bool
 	discoveryCancel context.CancelFunc
+	overheadStats   map[string]*overheadTracker
+	overheadMu      sync.RWMutex
 }
 
 const (
@@ -187,12 +189,13 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 				args:      []string{"node"},
 			},
 		},
-		pools:      pools,
-		fallback:   fallbackPool,
-		cleanupQ:   make(chan cleanupRequest, cleanupQueueSize),
-		limits:     make(map[string]ContainerLimits),
-		dead:       make(map[string]struct{}),
-		prewarming: make(map[string]struct{}),
+		pools:         pools,
+		fallback:      fallbackPool,
+		cleanupQ:      make(chan cleanupRequest, cleanupQueueSize),
+		limits:        make(map[string]ContainerLimits),
+		dead:          make(map[string]struct{}),
+		prewarming:    make(map[string]struct{}),
+		overheadStats: make(map[string]*overheadTracker),
 	}
 
 	for _, pool := range pools {
@@ -343,7 +346,8 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 
 	defer r.cleanup(jobPath)
 
-	effectiveTimeout, timeoutOverhead := computeExecutionBudget(timeout)
+	estimatedOverhead := r.estimateOverhead(canonical)
+	effectiveTimeout, timeoutOverhead := computeExecutionBudget(timeout, estimatedOverhead)
 
 	execCtx, cancel := context.WithTimeout(ctx, effectiveTimeout)
 	defer cancel()
@@ -403,8 +407,16 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 	cmd.Stderr = &stderrBuf
 
 	started := time.Now()
-	runErr := cmd.Run()
+	startErr := cmd.Start()
+	bootstrapDuration := time.Since(started)
+	var runErr error
+	if startErr != nil {
+		runErr = startErr
+	} else {
+		runErr = cmd.Wait()
+	}
 	duration := time.Since(started)
+	r.recordOverhead(canonical, bootstrapDuration)
 	completed := time.Now().UTC()
 	heartbeatCancel()
 	var heartbeatErr error
@@ -452,7 +464,8 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 
 	if runErr != nil {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return result, fmt.Errorf("execution timed out: limit=%s runtime=%s overhead=%s", timeout, duration.Round(time.Millisecond), timeoutOverhead), false
+			overheadRounded := timeoutOverhead.Round(10 * time.Millisecond)
+			return result, fmt.Errorf("execution timed out: limit=%s runtime=%s overhead=%s", timeout, duration.Round(time.Millisecond), overheadRounded), false
 		}
 		if execErr := (*exec.ExitError)(nil); errors.As(runErr, &execErr) {
 			return result, fmt.Errorf("process exited with status %d", exitCode), false
