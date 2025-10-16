@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,16 +56,9 @@ const (
 )
 
 const (
-	cleanupQueueSize   = 128
-	cleanupMaxAttempts = 5
-)
-
-const (
 	heartbeatInterval         = 2 * time.Second
 	heartbeatProbeTimeout     = 750 * time.Millisecond
 	heartbeatFailureThreshold = 3
-	prewarmInterval           = 30 * time.Second
-	prewarmTimeout            = 5 * time.Second
 	containerRecoveryTimeout  = 10 * time.Second
 	discoveryInterval         = 20 * time.Second
 )
@@ -86,11 +77,6 @@ type PoolSnapshot struct {
 	Limits     ContainerLimits
 }
 
-type cleanupRequest struct {
-	path    string
-	attempt int
-}
-
 type languageSpec struct {
 	extension string
 	args      []string
@@ -105,91 +91,6 @@ var languageAliases = map[string]string{
 	"nodejs":     "node",
 	"javascript": "node",
 	"js":         "node",
-}
-
-type ContainerLimits struct {
-	CPUs            float64
-	MemoryBytes     int64
-	PidsLimit       int64
-	ReadOnlyRoot    bool
-	NoNewPrivileges bool
-	SeccompProfile  string
-	AppArmorProfile string
-	CapDrop         []string
-	NetworkMode     string
-	Tmpfs           []string
-	Ulimits         map[string]UlimitRange
-}
-
-type UlimitRange struct {
-	Soft int64
-	Hard int64
-}
-
-func FormatLimits(limits ContainerLimits) string {
-	parts := make([]string, 0, 8)
-
-	if limits.CPUs > 0 {
-		parts = append(parts, fmt.Sprintf("cpu=%.2f", limits.CPUs))
-	}
-	if limits.MemoryBytes > 0 {
-		parts = append(parts, fmt.Sprintf("mem=%s", formatBytes(limits.MemoryBytes)))
-	}
-	if limits.PidsLimit > 0 {
-		parts = append(parts, fmt.Sprintf("pids=%d", limits.PidsLimit))
-	}
-	if limits.ReadOnlyRoot {
-		parts = append(parts, "ro-root")
-	}
-	if limits.NoNewPrivileges {
-		parts = append(parts, "no-new-privs")
-	}
-	if limits.SeccompProfile != "" {
-		parts = append(parts, fmt.Sprintf("seccomp=%s", limits.SeccompProfile))
-	}
-	if limits.AppArmorProfile != "" {
-		parts = append(parts, fmt.Sprintf("apparmor=%s", limits.AppArmorProfile))
-	}
-	if len(limits.CapDrop) > 0 {
-		parts = append(parts, fmt.Sprintf("cap-drop=%s", strings.Join(limits.CapDrop, ",")))
-	}
-	if limits.NetworkMode != "" {
-		parts = append(parts, fmt.Sprintf("net=%s", limits.NetworkMode))
-	}
-	if len(limits.Tmpfs) > 0 {
-		parts = append(parts, fmt.Sprintf("tmpfs=%d", len(limits.Tmpfs)))
-	}
-	if len(limits.Ulimits) > 0 {
-		ulimits := make([]string, 0, len(limits.Ulimits))
-		for name, rng := range limits.Ulimits {
-			ulimits = append(ulimits, fmt.Sprintf("%s=%d:%d", name, rng.Soft, rng.Hard))
-		}
-		sort.Strings(ulimits)
-		parts = append(parts, fmt.Sprintf("ulimits=[%s]", strings.Join(ulimits, ",")))
-	}
-
-	if len(parts) == 0 {
-		return "-"
-	}
-	return strings.Join(parts, " ")
-}
-
-func formatBytes(n int64) string {
-	if n <= 0 {
-		return "0B"
-	}
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%dB", n)
-	}
-	value := float64(n)
-	suffix := []string{"KB", "MB", "GB", "TB", "PB", "EB"}
-	exp := 0
-	for value >= unit && exp < len(suffix)-1 {
-		value /= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%s", value, suffix[exp])
 }
 
 func canonicalLanguageName(lang string) (string, bool) {
@@ -442,7 +343,9 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 
 	defer r.cleanup(jobPath)
 
-	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	effectiveTimeout, timeoutOverhead := computeExecutionBudget(timeout)
+
+	execCtx, cancel := context.WithTimeout(ctx, effectiveTimeout)
 	defer cancel()
 
 	heartbeatCtx, heartbeatCancel := context.WithCancel(execCtx)
@@ -549,7 +452,7 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 
 	if runErr != nil {
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
-			return result, fmt.Errorf("execution timed out after %s", timeout), false
+			return result, fmt.Errorf("execution timed out: limit=%s runtime=%s overhead=%s", timeout, duration.Round(time.Millisecond), timeoutOverhead), false
 		}
 		if execErr := (*exec.ExitError)(nil); errors.As(runErr, &execErr) {
 			return result, fmt.Errorf("process exited with status %d", exitCode), false
@@ -599,18 +502,6 @@ func (r *DockerRunner) acquireContainer(ctx context.Context, pool *containerPool
 		remaining := pool.availableCount()
 		log.Printf("%s[RUN]%s job %s (%s) assigned to container %s (%d/%d available)", colorGreen, colorReset, jobID, language, trimmed, remaining, total)
 		return trimmed, nil
-	}
-}
-
-func (r *DockerRunner) cleanup(path string) {
-	cleanPath := filepath.Clean(path)
-	if cleanPath == "." || cleanPath == "" {
-		return
-	}
-
-	req := cleanupRequest{path: cleanPath, attempt: 1}
-	if ok := r.enqueueCleanup(req); !ok {
-		go r.processCleanup(req)
 	}
 }
 
@@ -778,28 +669,6 @@ func (r *DockerRunner) recoverContainer(containerName, language string, pool *co
 	}
 }
 
-func (r *DockerRunner) startPrewarmLoop() {
-	go func() {
-		r.triggerPrewarm()
-		ticker := time.NewTicker(prewarmInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			r.triggerPrewarm()
-		}
-	}()
-}
-
-func (r *DockerRunner) triggerPrewarm() {
-	if !r.prewarmGate.CompareAndSwap(false, true) {
-		return
-	}
-
-	go func() {
-		defer r.prewarmGate.Store(false)
-		r.prewarmAll()
-	}()
-}
-
 func (r *DockerRunner) startDiscoveryLoop() {
 	ctx, cancel := context.WithCancel(context.Background())
 	r.discoveryCancel = cancel
@@ -928,80 +797,6 @@ func (r *DockerRunner) disableMissingContainers(current map[string][]string) {
 			}
 		}
 	}
-}
-
-func (r *DockerRunner) prewarmAll() {
-	names := r.allContainerNames()
-	if len(names) == 0 {
-		return
-	}
-
-	var wg sync.WaitGroup
-	for _, name := range names {
-		if r.isContainerDead(name) {
-			continue
-		}
-		if !r.beginPrewarm(name) {
-			continue
-		}
-		wg.Add(1)
-		go func(containerName string) {
-			defer wg.Done()
-			r.prewarmContainer(containerName)
-		}(name)
-	}
-
-	wg.Wait()
-}
-
-func (r *DockerRunner) beginPrewarm(name string) bool {
-	trimmed := strings.TrimSpace(name)
-	if trimmed == "" {
-		return false
-	}
-
-	r.prewarmMu.Lock()
-	defer r.prewarmMu.Unlock()
-	if _, exists := r.prewarming[trimmed]; exists {
-		return false
-	}
-	r.prewarming[trimmed] = struct{}{}
-	return true
-}
-
-func (r *DockerRunner) finishPrewarm(name string) {
-	trimmed := strings.TrimSpace(name)
-	if trimmed == "" {
-		return
-	}
-	r.prewarmMu.Lock()
-	delete(r.prewarming, trimmed)
-	r.prewarmMu.Unlock()
-}
-
-func (r *DockerRunner) isContainerPrewarming(name string) bool {
-	trimmed := strings.TrimSpace(name)
-	if trimmed == "" {
-		return false
-	}
-	r.prewarmMu.RLock()
-	_, ok := r.prewarming[trimmed]
-	r.prewarmMu.RUnlock()
-	return ok
-}
-
-func (r *DockerRunner) prewarmContainer(name string) {
-	defer r.finishPrewarm(name)
-
-	ctx, cancel := context.WithTimeout(context.Background(), prewarmTimeout)
-	defer cancel()
-
-	if err := r.ensureContainer(ctx, name); err != nil {
-		log.Printf("%s[WARN]%s prewarm ensure failed for container %s: %v", colorYellow, colorReset, name, err)
-		return
-	}
-
-	r.markContainerAlive(name)
 }
 
 func (r *DockerRunner) allContainerNames() []string {
@@ -1137,284 +932,6 @@ func detectContainerPools(dockerBin string) (map[string][]string, error) {
 	return results, nil
 }
 
-func (r *DockerRunner) captureContainerLimits(names []string) {
-	var pending []string
-
-	r.limitsMu.RLock()
-	for _, raw := range names {
-		name := strings.TrimSpace(raw)
-		if name == "" {
-			continue
-		}
-		if r.isContainerDead(name) {
-			continue
-		}
-		if _, exists := r.limits[name]; !exists {
-			pending = append(pending, name)
-		}
-	}
-	r.limitsMu.RUnlock()
-
-	for _, name := range pending {
-		info, err := fetchContainerLimits(r.dockerBin, name)
-		if err != nil {
-			log.Printf("%s[WARN]%s failed to inspect container %s: %v", colorYellow, colorReset, name, err)
-			continue
-		}
-		r.limitsMu.Lock()
-		if _, exists := r.limits[name]; !exists {
-			r.limits[name] = info
-		}
-		r.limitsMu.Unlock()
-		r.markContainerAlive(name)
-	}
-}
-
-func (r *DockerRunner) aggregateLimits(names []string) ContainerLimits {
-	r.limitsMu.RLock()
-	defer r.limitsMu.RUnlock()
-
-	var agg ContainerLimits
-	first := true
-	for _, raw := range names {
-		name := strings.TrimSpace(raw)
-		if name == "" {
-			continue
-		}
-		info, ok := r.limits[name]
-		if !ok {
-			continue
-		}
-		if first {
-			agg = info
-			agg.CapDrop = append([]string(nil), info.CapDrop...)
-			agg.Tmpfs = append([]string(nil), info.Tmpfs...)
-			agg.Ulimits = cloneUlimitMap(info.Ulimits)
-			first = false
-			continue
-		}
-		agg.CPUs = minFloat(agg.CPUs, info.CPUs)
-		agg.MemoryBytes = minInt64Positive(agg.MemoryBytes, info.MemoryBytes)
-		agg.PidsLimit = minInt64Positive(agg.PidsLimit, info.PidsLimit)
-		agg.ReadOnlyRoot = agg.ReadOnlyRoot && info.ReadOnlyRoot
-		agg.NoNewPrivileges = agg.NoNewPrivileges && info.NoNewPrivileges
-		agg.SeccompProfile = selectCommonString(agg.SeccompProfile, info.SeccompProfile)
-		agg.AppArmorProfile = selectCommonString(agg.AppArmorProfile, info.AppArmorProfile)
-		agg.CapDrop = intersectStrings(agg.CapDrop, info.CapDrop)
-		agg.NetworkMode = selectCommonString(agg.NetworkMode, info.NetworkMode)
-		agg.Tmpfs = intersectStrings(agg.Tmpfs, info.Tmpfs)
-		agg.Ulimits = mergeUlimits(agg.Ulimits, info.Ulimits)
-	}
-	return agg
-}
-
-type rawContainerInspect struct {
-	HostConfig struct {
-		NanoCPUs        int64             `json:"NanoCpus"`
-		CPUQuota        int64             `json:"CpuQuota"`
-		CPUPeriod       int64             `json:"CpuPeriod"`
-		Memory          int64             `json:"Memory"`
-		PidsLimit       int64             `json:"PidsLimit"`
-		SecurityOpt     []string          `json:"SecurityOpt"`
-		CapDrop         []string          `json:"CapDrop"`
-		ReadonlyRootfs  bool              `json:"ReadonlyRootfs"`
-		NoNewPrivileges bool              `json:"NoNewPrivileges"`
-		NetworkMode     string            `json:"NetworkMode"`
-		Tmpfs           map[string]string `json:"Tmpfs"`
-		Ulimits         []struct {
-			Name string `json:"Name"`
-			Soft int64  `json:"Soft"`
-			Hard int64  `json:"Hard"`
-		} `json:"Ulimits"`
-	} `json:"HostConfig"`
-	AppArmorProfile string `json:"AppArmorProfile"`
-}
-
-func fetchContainerLimits(dockerBin, name string) (ContainerLimits, error) {
-	cmd := exec.Command(dockerBin, "inspect", name)
-	output, err := cmd.Output()
-	if err != nil {
-		return ContainerLimits{}, fmt.Errorf("docker inspect %s: %w", name, err)
-	}
-
-	var decoded []rawContainerInspect
-	if err := json.Unmarshal(output, &decoded); err != nil {
-		return ContainerLimits{}, fmt.Errorf("parse inspect for %s: %w", name, err)
-	}
-	if len(decoded) == 0 {
-		return ContainerLimits{}, fmt.Errorf("no inspect data for %s", name)
-	}
-	info := decoded[0]
-
-	return ContainerLimits{
-		CPUs:            calculateCPUs(info.HostConfig.NanoCPUs, info.HostConfig.CPUQuota, info.HostConfig.CPUPeriod),
-		MemoryBytes:     info.HostConfig.Memory,
-		PidsLimit:       info.HostConfig.PidsLimit,
-		ReadOnlyRoot:    info.HostConfig.ReadonlyRootfs,
-		NoNewPrivileges: info.HostConfig.NoNewPrivileges || hasSecurityOpt(info.HostConfig.SecurityOpt, "no-new-privileges:true"),
-		SeccompProfile:  extractSecurityOpt(info.HostConfig.SecurityOpt, "seccomp"),
-		AppArmorProfile: info.AppArmorProfile,
-		CapDrop:         append([]string(nil), info.HostConfig.CapDrop...),
-		NetworkMode:     info.HostConfig.NetworkMode,
-		Tmpfs:           mapTmpfs(info.HostConfig.Tmpfs),
-		Ulimits:         mapUlimits(info.HostConfig.Ulimits),
-	}, nil
-}
-
-func calculateCPUs(nanoCPUs, quota, period int64) float64 {
-	if nanoCPUs > 0 {
-		return float64(nanoCPUs) / 1_000_000_000
-	}
-	if quota > 0 && period > 0 {
-		return float64(quota) / float64(period)
-	}
-	return 0
-}
-
-func hasSecurityOpt(opts []string, target string) bool {
-	for _, opt := range opts {
-		if opt == target {
-			return true
-		}
-	}
-	return false
-}
-
-func extractSecurityOpt(opts []string, prefix string) string {
-	needle := prefix + "="
-	for _, opt := range opts {
-		if strings.HasPrefix(opt, needle) {
-			return strings.TrimPrefix(opt, needle)
-		}
-	}
-	return ""
-}
-
-func mapTmpfs(tmpfs map[string]string) []string {
-	if len(tmpfs) == 0 {
-		return nil
-	}
-	var paths []string
-	for path, opts := range tmpfs {
-		if opts != "" {
-			paths = append(paths, fmt.Sprintf("%s (%s)", path, opts))
-			continue
-		}
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	return paths
-}
-
-func mapUlimits(src []struct {
-	Name string `json:"Name"`
-	Soft int64  `json:"Soft"`
-	Hard int64  `json:"Hard"`
-}) map[string]UlimitRange {
-	if len(src) == 0 {
-		return nil
-	}
-	result := make(map[string]UlimitRange, len(src))
-	for _, item := range src {
-		result[strings.ToLower(item.Name)] = UlimitRange{Soft: item.Soft, Hard: item.Hard}
-	}
-	return result
-}
-
-func minFloat(a, b float64) float64 {
-	if a == 0 {
-		return b
-	}
-	if b == 0 {
-		return a
-	}
-	return math.Min(a, b)
-}
-
-func minInt64Positive(a, b int64) int64 {
-	switch {
-	case a <= 0:
-		return b
-	case b <= 0:
-		return a
-	case a < b:
-		return a
-	default:
-		return b
-	}
-}
-
-func selectCommonString(current, next string) string {
-	if current == "" {
-		return next
-	}
-	if next == "" {
-		return current
-	}
-	if current == next {
-		return current
-	}
-	return "mixed"
-}
-
-func intersectStrings(a, b []string) []string {
-	if len(a) == 0 {
-		return append([]string(nil), b...)
-	}
-	if len(b) == 0 {
-		return append([]string(nil), a...)
-	}
-	set := make(map[string]struct{}, len(b))
-	for _, item := range b {
-		set[item] = struct{}{}
-	}
-	var result []string
-	for _, item := range a {
-		if _, ok := set[item]; ok {
-			result = append(result, item)
-		}
-	}
-	return result
-}
-
-func mergeUlimits(a, b map[string]UlimitRange) map[string]UlimitRange {
-	if len(a) == 0 {
-		if len(b) == 0 {
-			return nil
-		}
-		result := make(map[string]UlimitRange, len(b))
-		for k, v := range b {
-			result[k] = v
-		}
-		return result
-	}
-	if len(b) == 0 {
-		return a
-	}
-	for name, limits := range b {
-		if existing, ok := a[name]; ok {
-			a[name] = UlimitRange{
-				Soft: minInt64Positive(existing.Soft, limits.Soft),
-				Hard: minInt64Positive(existing.Hard, limits.Hard),
-			}
-			continue
-		}
-		a[name] = limits
-	}
-	return a
-}
-
-func cloneUlimitMap(in map[string]UlimitRange) map[string]UlimitRange {
-	if len(in) == 0 {
-		return nil
-	}
-	cloned := make(map[string]UlimitRange, len(in))
-	for k, v := range in {
-		cloned[k] = v
-	}
-	return cloned
-}
-
 func (r *DockerRunner) markContainerDead(name string) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
@@ -1480,77 +997,4 @@ func (r *DockerRunner) disableContainer(pool *containerPool, name string) {
 	r.limitsMu.Lock()
 	delete(r.limits, trimmed)
 	r.limitsMu.Unlock()
-}
-
-func (r *DockerRunner) startCleanupWorker() {
-	go func() {
-		for req := range r.cleanupQ {
-			r.processCleanup(req)
-		}
-	}()
-}
-
-func (r *DockerRunner) enqueueCleanup(req cleanupRequest) bool {
-	if r.cleanupQ == nil {
-		return false
-	}
-	select {
-	case r.cleanupQ <- req:
-		return true
-	default:
-		return false
-	}
-}
-
-func (r *DockerRunner) processCleanup(req cleanupRequest) {
-	if req.path == "" {
-		return
-	}
-
-	err := os.RemoveAll(req.path)
-	if err == nil || errors.Is(err, fs.ErrNotExist) {
-		log.Printf("%s[CLEAN]%s removed job artifacts at %s", colorMagenta, colorReset, req.path)
-		return
-	}
-
-	if req.attempt >= cleanupMaxAttempts {
-		log.Printf("%s[ERROR]%s failed to cleanup %s after %d attempts: %v", colorRed, colorReset, req.path, req.attempt, err)
-		return
-	}
-
-	delay := time.Duration(req.attempt) * time.Second
-	log.Printf("%s[RETRY]%s cleanup retry for %s in %s (attempt %d/%d)", colorYellow, colorReset, req.path, delay, req.attempt+1, cleanupMaxAttempts)
-	time.Sleep(delay)
-	req.attempt++
-	if ok := r.enqueueCleanup(req); !ok {
-		go r.processCleanup(req)
-	}
-}
-
-func (r *DockerRunner) purgeOrphanedJobDirs() {
-	entries, err := os.ReadDir(r.jobDir)
-	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			log.Printf("%s[WARN]%s failed to scan job dir %s: %v", colorYellow, colorReset, r.jobDir, err)
-		}
-		return
-	}
-
-	if len(entries) == 0 {
-		return
-	}
-
-	log.Printf("%s[CLEAN]%s found %d orphaned job artifact(s) to purge", colorMagenta, colorReset, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		req := cleanupRequest{
-			path:    filepath.Join(r.jobDir, entry.Name()),
-			attempt: 1,
-		}
-		if ok := r.enqueueCleanup(req); !ok {
-			go r.processCleanup(req)
-		}
-	}
 }
