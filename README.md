@@ -30,6 +30,11 @@ Stage 2 of the Go-based code execution service. This iteration introduces asynch
    ```bash
    docker compose up -d redis
    ```
+1. **Start PostgreSQL for account data** (inside the dev container):
+   ```bash
+   docker compose up -d postgres
+   ```
+   Credentials are for local development only. Data persists in the `postgres-data` volume so the authentication tables survive container restarts.
 1. **Run the API**:
    ```bash
    go run ./cmd/api
@@ -46,10 +51,24 @@ Stage 2 of the Go-based code execution service. This iteration introduces asynch
    ```
    The response returns the queued job identifier and creation timestamp. Supported languages are `go`, `python`, and `javascript` (aliases `js`, `node`, `nodejs`). You may provide optional `stdin` and `timeout` values—`timeout` uses Go duration syntax and overrides the service default set via `SANDBOX_TIMEOUT`.
 1. **Poll job status**:
+
    ```bash
    curl http://localhost:8080/v1/execute/<job-id>
    ```
+
    Responses include job metadata, the most recent status, and execution output once the job completes.
+
+   ## Authentication Portal Frontend
+
+   The marketing site and authentication portal live in `website-codeportal`. It currently serves register and login forms that will submit to the API once the account endpoints land.
+
+   ```bash
+   cd website-codeportal
+   npm install
+   npm run dev
+   ```
+
+   Replace the placeholder submit handlers with real API calls after wiring the Go service to PostgreSQL.
 
 ## Configuration
 
@@ -84,3 +103,4 @@ go test ./...
 - Harden sandbox isolation (cgroups, seccomp) and monitor runtime resource usage.
 - Instrument the service with structured logging and tracing.
 - Wire up CI and automation.
+- Implement account service backed by PostgreSQL and connect the frontend auth flows.

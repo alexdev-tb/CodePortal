@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alexdev-tb/code-sandbox-api/internal/executor"
+	"github.com/alexdev-tb/CodePortal/internal/executor"
 )
 
 type Handler struct {

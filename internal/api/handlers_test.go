@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alexdev-tb/code-sandbox-api/internal/executor"
+	"github.com/alexdev-tb/CodePortal/internal/executor"
 )
 
 type stubExecutor struct {

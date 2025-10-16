@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/alexdev-tb/code-sandbox-api/internal/config"
+	"github.com/alexdev-tb/CodePortal/internal/config"
 )
 
 var ErrServerClosed = http.ErrServerClosed

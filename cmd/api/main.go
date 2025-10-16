@@ -9,10 +9,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/alexdev-tb/code-sandbox-api/internal/api"
-	"github.com/alexdev-tb/code-sandbox-api/internal/config"
-	"github.com/alexdev-tb/code-sandbox-api/internal/executor"
-	"github.com/alexdev-tb/code-sandbox-api/internal/server"
+	"github.com/alexdev-tb/CodePortal/internal/api"
+	"github.com/alexdev-tb/CodePortal/internal/config"
+	"github.com/alexdev-tb/CodePortal/internal/executor"
+	"github.com/alexdev-tb/CodePortal/internal/server"
 )
 
 const (

@@ -1,5 +1,4 @@
-module github.com/alexdev-tb/code-sandbox-api
-
+module github.com/alexdev-tb/CodePortal
 go 1.24
 
 require (
