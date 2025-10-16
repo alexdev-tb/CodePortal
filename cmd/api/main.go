@@ -15,6 +15,13 @@ import (
 	"github.com/alexdev-tb/code-sandbox-api/internal/server"
 )
 
+const (
+	colorReset   = "\033[0m"
+	colorMagenta = "\033[35m"
+	colorCyan    = "\033[36m"
+	colorYellow  = "\033[33m"
+)
+
 func main() {
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -34,12 +41,14 @@ func main() {
 
 	store := executor.NewRedisJobStore(rdb)
 	runner := executor.NewDockerRunner(executor.RunnerConfig{
-		Container:    cfg.Sandbox.Container,
-		JobDir:       cfg.Sandbox.JobDir,
-		DockerBinary: cfg.Sandbox.Docker.Binary,
-		Network:      cfg.Sandbox.Docker.Network,
-		ExecUser:     cfg.Sandbox.Docker.User,
+		Container:          cfg.Sandbox.Container,
+		LanguageContainers: cfg.Sandbox.Languages,
+		JobDir:             cfg.Sandbox.JobDir,
+		DockerBinary:       cfg.Sandbox.Docker.Binary,
+		Network:            cfg.Sandbox.Docker.Network,
+		ExecUser:           cfg.Sandbox.Docker.User,
 	})
+	logPoolDetails(runner.PoolSnapshots())
 	execService := executor.NewService(store, runner, cfg.Sandbox.Timeout)
 	handlers := api.NewHandler(execService)
 	router := api.NewRouter(handlers)
@@ -57,4 +66,24 @@ func main() {
 		log.Printf("server error: %v", err)
 		os.Exit(1)
 	}
+}
+
+func logPoolDetails(snapshots []executor.PoolSnapshot) {
+	if len(snapshots) == 0 {
+		log.Printf("%s[BOOT]%s no sandbox containers detected", colorYellow, colorReset)
+		return
+	}
+
+	log.Printf("%s[BOOT]%s detected %d sandbox pool(s)", colorMagenta, colorReset, len(snapshots))
+	for _, snap := range snapshots {
+		label := snap.Language
+		if snap.Fallback {
+			label = "fallback"
+		}
+		log.Printf("%s[BOOT]%s %-9s containers=%v total=%d available=%d limits=%s", colorCyan, colorReset, label, snap.Containers, snap.Total, snap.Available, formatLimits(snap.Limits))
+	}
+}
+
+func formatLimits(l executor.ContainerLimits) string {
+	return executor.FormatLimits(l)
 }

@@ -49,6 +49,10 @@ type stubRunner struct {
 	lastRequest Request
 }
 
+func (s *stubRunner) PoolSnapshots() []PoolSnapshot {
+	return nil
+}
+
 func (s *stubRunner) Run(_ context.Context, _ string, req Request, timeout time.Duration) (Result, error) {
 	s.mu.Lock()
 	s.lastTimeout = timeout

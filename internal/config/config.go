@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type Redis struct {
 
 type Sandbox struct {
 	Container string
+	Languages map[string][]string
 	JobDir    string
 	Docker    Docker
 	Timeout   time.Duration
@@ -55,8 +57,14 @@ func FromEnv() (Config, error) {
 		DB:       getInt("REDIS_DB", 0),
 	}
 
+	langContainers, err := parseLanguageContainers(getEnv("SANDBOX_LANGUAGE_CONTAINERS", ""))
+	if err != nil {
+		return Config{}, fmt.Errorf("parse sandbox language containers: %w", err)
+	}
+
 	sandbox := Sandbox{
-		Container: getEnv("SANDBOX_CONTAINER", "code-sandbox-runner"),
+		Container: getEnv("SANDBOX_CONTAINER", ""),
+		Languages: langContainers,
 		JobDir:    getEnv("SANDBOX_JOB_DIR", "/tmp/jobs"),
 		Timeout:   getDuration("SANDBOX_TIMEOUT", 3*time.Second),
 		Docker: Docker{
@@ -74,6 +82,48 @@ func FromEnv() (Config, error) {
 	}
 
 	return Config{HTTP: http, Redis: redis, Sandbox: sandbox}, nil
+}
+
+func parseLanguageContainers(raw string) (map[string][]string, error) {
+	containers := make(map[string][]string)
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return containers, nil
+	}
+
+	entries := strings.Split(trimmed, ",")
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid language container entry %q", entry)
+		}
+
+		lang := strings.ToLower(strings.TrimSpace(parts[0]))
+		if lang == "" {
+			return nil, fmt.Errorf("missing language in entry %q", entry)
+		}
+
+		rawContainers := strings.Split(parts[1], "|")
+		var names []string
+		for _, name := range rawContainers {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				names = append(names, name)
+			}
+		}
+		if len(names) == 0 {
+			return nil, fmt.Errorf("language %q entry must include at least one container", lang)
+		}
+
+		containers[lang] = names
+	}
+
+	return containers, nil
 }
 
 func getEnv(key, fallback string) string {

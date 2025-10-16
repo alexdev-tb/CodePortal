@@ -161,6 +161,7 @@ func (s *Service) execute(id string) {
 
 	if err := s.store.Update(ctx, job); err != nil {
 		log.Printf("executor: finalize job %s: %v", id, err)
+		return
 	}
 }
 
