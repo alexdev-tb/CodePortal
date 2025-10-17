@@ -8,13 +8,10 @@ x-runner-go: &runner-go
   stdin_open: true
   security_opt:
     - no-new-privileges:true
-  volumes:
-    - /tmp/jobs:/tmp/jobs:rw
   labels:
     sandbox.language: go
   tmpfs:
-    - /tmp/go-build
-    - /tmp/go-mod
+    - /tmp:rw,exec,nosuid,nodev,mode=1777
 
 x-runner-python: &runner-python
   build:
@@ -26,10 +23,10 @@ x-runner-python: &runner-python
   stdin_open: true
   security_opt:
     - no-new-privileges:true
-  volumes:
-    - /tmp/jobs:/tmp/jobs:rw
   labels:
     sandbox.language: python
+  tmpfs:
+    - /tmp:rw,exec,nosuid,nodev,mode=1777
 
 x-runner-node: &runner-node
   build:
@@ -41,10 +38,10 @@ x-runner-node: &runner-node
   stdin_open: true
   security_opt:
     - no-new-privileges:true
-  volumes:
-    - /tmp/jobs:/tmp/jobs:rw
   labels:
     sandbox.language: node
+  tmpfs:
+    - /tmp:rw,exec,nosuid,nodev,mode=1777
 
 services:
   runner-go-1:

@@ -25,7 +25,7 @@ Stage 2 of the Go-based code execution service. This iteration introduces asynch
        runner-python-1 runner-python-2 \
        runner-node-1 runner-node-2
    ```
-   Go runners embed only the Go toolchain, Python runners embed only CPython, and Node runners embed only Node.js. The API automatically balances work across the pool based on language, so Go jobs route to `runner-go-*`, Python jobs to `runner-python-*`, and JavaScript/Node jobs to `runner-node-*`. All runners share the `/tmp/jobs` volume to exchange job files with the host. Containers are discovered dynamically by reading the `sandbox.language` Docker label, so additional language-specific runners can be added without configuration changes as long as they apply the label (for example `sandbox.language=node`).
+   Go runners embed only the Go toolchain, Python runners embed only CPython, and Node runners embed only Node.js. The API automatically balances work across the pool based on language, so Go jobs route to `runner-go-*`, Python jobs to `runner-python-*`, and JavaScript/Node jobs to `runner-node-*`. Job files are streamed into each container at execution time and stored on that container's in-memory `/tmp` (mounted with `exec` permission) so the language runtimes can spawn binaries without touching the host filesystem. After each run the executor removes its workspace and any extra files the job created under `/tmp`, returning the container to its baseline state. Containers are discovered dynamically by reading the `sandbox.language` Docker label, so additional language-specific runners can be added without configuration changes as long as they apply the label (for example `sandbox.language=node`).
 1. **Start Redis** (inside the dev container):
    ```bash
    docker compose up -d redis
@@ -84,7 +84,8 @@ Environment variables:
 - `REDIS_DB`: Redis database index (default `0`).
 - `SANDBOX_CONTAINER`: Optional fallback container used when no language-specific pool is detected.
 - `SANDBOX_LANGUAGE_CONTAINERS`: Optional comma-separated mapping of languages to container pools. When unset, the service auto-discovers containers by reading the `sandbox.language` label from running Docker containers (expected values: `go`, `python`, `node`). Each language entry uses `|` to separate container names.
-- `SANDBOX_JOB_DIR`: Host directory used for job files (default `/tmp/jobs`).
+- `SANDBOX_JOB_DIR`: Host staging directory used before streaming job artifacts into containers (default `/tmp/codeportal-jobs`). Files are cleaned up after execution and are never mounted back into the sandbox runtime.
+- `SANDBOX_CONTAINER_JOB_DIR`: Directory inside each sandbox container where job files are materialized (default `/tmp`). Must reside on a writable filesystem such as a tmpfs mount.
 - `SANDBOX_TIMEOUT`: Maximum wall-clock runtime per job (default `3s`).
 - `SANDBOX_DOCKER_BIN`: Docker CLI binary to invoke (default `docker`).
 - `SANDBOX_NETWORK`: Optional Docker network to attach when exec'ing (default empty).

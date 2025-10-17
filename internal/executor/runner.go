@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -21,33 +22,37 @@ type RunnerConfig struct {
 	Container          string
 	LanguageContainers map[string][]string
 	JobDir             string
+	ContainerJobDir    string
 	DockerBinary       string
 	Network            string
 	ExecUser           string
 }
 
 type DockerRunner struct {
-	jobDir          string
-	dockerBin       string
-	network         string
-	execUser        string
-	languages       map[string]languageSpec
-	pools           map[string]*containerPool
-	fallback        *containerPool
-	cleanupQ        chan cleanupRequest
-	limits          map[string]ContainerLimits
-	limitsMu        sync.RWMutex
-	dead            map[string]struct{}
-	deadMu          sync.RWMutex
-	prewarming      map[string]struct{}
-	prewarmMu       sync.RWMutex
-	prewarmGate     atomic.Bool
-	discoveryGate   atomic.Bool
-	discoveryCancel context.CancelFunc
-	overheadStats   map[string]*overheadTracker
-	overheadMu      sync.RWMutex
-	prewarmState    map[string]*prewarmStatus
-	prewarmStateMu  sync.Mutex
+	jobDir           string
+	containerJobRoot string
+	dockerBin        string
+	network          string
+	execUser         string
+	languages        map[string]languageSpec
+	pools            map[string]*containerPool
+	fallback         *containerPool
+	cleanupQ         chan cleanupRequest
+	limits           map[string]ContainerLimits
+	limitsMu         sync.RWMutex
+	dead             map[string]struct{}
+	deadMu           sync.RWMutex
+	prewarming       map[string]struct{}
+	prewarmMu        sync.RWMutex
+	prewarmGate      atomic.Bool
+	discoveryGate    atomic.Bool
+	discoveryCancel  context.CancelFunc
+	overheadStats    map[string]*overheadTracker
+	overheadMu       sync.RWMutex
+	prewarmState     map[string]*prewarmStatus
+	prewarmStateMu   sync.Mutex
+	tmpBaselines     map[string]map[string]struct{}
+	tmpBaselineMu    sync.RWMutex
 }
 
 const (
@@ -111,7 +116,14 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 
 	jobDir := strings.TrimSpace(cfg.JobDir)
 	if jobDir == "" {
-		jobDir = "/tmp/jobs"
+		jobDir = filepath.Join(os.TempDir(), "codeportal-jobs")
+	}
+	containerJobRoot := strings.TrimSpace(cfg.ContainerJobDir)
+	if containerJobRoot == "" {
+		containerJobRoot = "/tmp"
+	}
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		log.Printf("%s[WARN]%s ensure job staging dir %s: %v", colorYellow, colorReset, jobDir, err)
 	}
 
 	dockerBin := strings.TrimSpace(cfg.DockerBinary)
@@ -173,10 +185,11 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 	}
 
 	r := &DockerRunner{
-		jobDir:    jobDir,
-		dockerBin: dockerBin,
-		network:   network,
-		execUser:  execUser,
+		jobDir:           jobDir,
+		containerJobRoot: containerJobRoot,
+		dockerBin:        dockerBin,
+		network:          network,
+		execUser:         execUser,
 		languages: map[string]languageSpec{
 			"go": {
 				extension: "go",
@@ -199,6 +212,7 @@ func NewDockerRunner(cfg RunnerConfig) *DockerRunner {
 		prewarming:    make(map[string]struct{}),
 		overheadStats: make(map[string]*overheadTracker),
 		prewarmState:  make(map[string]*prewarmStatus),
+		tmpBaselines:  make(map[string]map[string]struct{}),
 	}
 
 	for _, pool := range pools {
@@ -310,44 +324,82 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 		return Result{}, err, true
 	}
 	r.markContainerAlive(containerName)
+	if tmpCtx, tmpCancel := context.WithTimeout(ctx, time.Second); tmpCancel != nil {
+		r.ensureTmpBaseline(tmpCtx, containerName)
+		tmpCancel()
+	}
+	baselineCtx, baselineCancel := context.WithTimeout(ctx, time.Second)
+	r.ensureTmpBaseline(baselineCtx, containerName)
+	baselineCancel()
 
-	jobPath := filepath.Join(r.jobDir, jobID)
-	if err := os.MkdirAll(jobPath, 0o777); err != nil {
+	hostJobPath := filepath.Join(r.jobDir, jobID)
+	if err := os.MkdirAll(hostJobPath, 0o755); err != nil {
 		now := time.Now().UTC()
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("prepare job dir: %w", err), false
 	}
 
-	sourcePath := filepath.Join(jobPath, fmt.Sprintf("main.%s", spec.extension))
-	if err := os.WriteFile(sourcePath, []byte(req.Code), 0o666); err != nil {
+	sourceFilename := fmt.Sprintf("main.%s", spec.extension)
+	hostSourcePath := filepath.Join(hostJobPath, sourceFilename)
+	if err := os.WriteFile(hostSourcePath, []byte(req.Code), 0o644); err != nil {
 		now := time.Now().UTC()
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("write source: %w", err), false
 	}
 
-	cacheDir := filepath.Join(jobPath, "cache")
-	if err := os.MkdirAll(cacheDir, 0o777); err != nil {
+	hostCacheDir := filepath.Join(hostJobPath, "cache")
+	if err := os.MkdirAll(hostCacheDir, 0o755); err != nil {
 		now := time.Now().UTC()
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("prepare cache dir: %w", err), false
 	}
 
-	modCacheDir := filepath.Join(jobPath, "gomod")
-	if err := os.MkdirAll(modCacheDir, 0o777); err != nil {
+	hostModCacheDir := filepath.Join(hostJobPath, "gomod")
+	if err := os.MkdirAll(hostModCacheDir, 0o755); err != nil {
 		now := time.Now().UTC()
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("prepare module cache dir: %w", err), false
 	}
 
-	tmpDir := filepath.Join(jobPath, "tmp")
-	if err := os.MkdirAll(tmpDir, 0o777); err != nil {
+	hostTmpDir := filepath.Join(hostJobPath, "tmp")
+	if err := os.MkdirAll(hostTmpDir, 0o755); err != nil {
 		now := time.Now().UTC()
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("prepare temp dir: %w", err), false
 	}
 
-	pyCacheDir := filepath.Join(jobPath, "pycache")
-	if err := os.MkdirAll(pyCacheDir, 0o777); err != nil {
+	hostPyCacheDir := filepath.Join(hostJobPath, "pycache")
+	if err := os.MkdirAll(hostPyCacheDir, 0o755); err != nil {
 		now := time.Now().UTC()
 		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("prepare python cache dir: %w", err), false
 	}
 
-	defer r.cleanup(jobPath)
+	defer r.cleanup(hostJobPath)
+
+	containerJobPath := path.Join(r.containerJobRoot, jobID)
+	workspaceReady := false
+	defer func() {
+		if !workspaceReady {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		if err := r.dockerExec(cleanupCtx, containerName, "rm", "-rf", containerJobPath); err != nil {
+			log.Printf("%s[WARN]%s cleanup container workspace %s/%s: %v", colorYellow, colorReset, containerName, containerJobPath, err)
+		}
+		r.restoreContainerTmp(cleanupCtx, containerName)
+	}()
+
+	if err := r.prepareContainerWorkspace(ctx, containerName, containerJobPath); err != nil {
+		now := time.Now().UTC()
+		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("prepare container workspace: %w", err), false
+	}
+	workspaceReady = true
+	if err := r.copyWorkspaceToContainer(ctx, hostJobPath, containerName, containerJobPath); err != nil {
+		now := time.Now().UTC()
+		return Result{ExitCode: -1, CompletedAt: now}, fmt.Errorf("seal workspace: %w", err), false
+	}
+
+	containerSourcePath := path.Join(containerJobPath, sourceFilename)
+	containerCacheDir := path.Join(containerJobPath, "cache")
+	containerModCacheDir := path.Join(containerJobPath, "gomod")
+	containerTmpDir := path.Join(containerJobPath, "tmp")
+	containerPyCacheDir := path.Join(containerJobPath, "pycache")
 
 	estimatedOverhead := r.estimateOverhead(canonical)
 	effectiveTimeout, timeoutOverhead := computeExecutionBudget(timeout, estimatedOverhead)
@@ -367,24 +419,24 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 	}
 
 	envVars := []string{
-		fmt.Sprintf("TMPDIR=%s", tmpDir),
+		fmt.Sprintf("TMPDIR=%s", containerTmpDir),
 	}
 	if canonical == "go" {
 		envVars = append(envVars,
-			fmt.Sprintf("GOCACHE=%s", cacheDir),
-			fmt.Sprintf("GOMODCACHE=%s", modCacheDir),
-			fmt.Sprintf("GOTMPDIR=%s", tmpDir),
+			fmt.Sprintf("GOCACHE=%s", containerCacheDir),
+			fmt.Sprintf("GOMODCACHE=%s", containerModCacheDir),
+			fmt.Sprintf("GOTMPDIR=%s", containerTmpDir),
 			"GO111MODULE=off",
 		)
 	}
 	if canonical == "python" {
 		envVars = append(envVars,
-			fmt.Sprintf("PYTHONPYCACHEPREFIX=%s", pyCacheDir),
+			fmt.Sprintf("PYTHONPYCACHEPREFIX=%s", containerPyCacheDir),
 		)
 	}
 	if canonical == "node" {
 		envVars = append(envVars,
-			fmt.Sprintf("HOME=%s", jobPath),
+			fmt.Sprintf("HOME=%s", containerJobPath),
 			"NODE_OPTIONS=--max-old-space-size=192",
 		)
 	}
@@ -393,10 +445,10 @@ func (r *DockerRunner) runOnce(ctx context.Context, jobID string, req Request, t
 		cmdArgs = append(cmdArgs, "--env", env)
 	}
 
-	cmdArgs = append(cmdArgs, "--workdir", jobPath)
+	cmdArgs = append(cmdArgs, "--workdir", containerJobPath)
 	cmdArgs = append(cmdArgs, containerName)
 	cmdArgs = append(cmdArgs, spec.args...)
-	cmdArgs = append(cmdArgs, filepath.Join(jobPath, filepath.Base(sourcePath)))
+	cmdArgs = append(cmdArgs, containerSourcePath)
 
 	cmd := exec.CommandContext(execCtx, r.dockerBin, cmdArgs...)
 
@@ -815,6 +867,145 @@ func (r *DockerRunner) disableMissingContainers(current map[string][]string) {
 			}
 		}
 	}
+}
+
+func (r *DockerRunner) prepareContainerWorkspace(ctx context.Context, containerName, containerPath string) error {
+	if err := r.dockerExec(ctx, containerName, "mkdir", "-p", r.containerJobRoot); err != nil {
+		return fmt.Errorf("ensure job root %s: %w", r.containerJobRoot, err)
+	}
+	if err := r.dockerExec(ctx, containerName, "rm", "-rf", containerPath); err != nil {
+		return fmt.Errorf("purge workspace %s: %w", containerPath, err)
+	}
+	if err := r.dockerExec(ctx, containerName, "mkdir", "-p", containerPath); err != nil {
+		return fmt.Errorf("create workspace %s: %w", containerPath, err)
+	}
+	return nil
+}
+
+func (r *DockerRunner) ensureTmpBaseline(ctx context.Context, containerName string) {
+	r.tmpBaselineMu.RLock()
+	if _, ok := r.tmpBaselines[containerName]; ok {
+		r.tmpBaselineMu.RUnlock()
+		return
+	}
+	r.tmpBaselineMu.RUnlock()
+
+	lst, err := r.listContainerTmp(ctx, containerName)
+	if err != nil {
+		log.Printf("%s[WARN]%s snapshot tmp baseline for %s failed: %v", colorYellow, colorReset, containerName, err)
+		return
+	}
+	baseline := make(map[string]struct{}, len(lst))
+	for _, entry := range lst {
+		baseline[entry] = struct{}{}
+	}
+	r.tmpBaselineMu.Lock()
+	r.tmpBaselines[containerName] = baseline
+	r.tmpBaselineMu.Unlock()
+}
+
+func (r *DockerRunner) restoreContainerTmp(ctx context.Context, containerName string) {
+	r.tmpBaselineMu.RLock()
+	baseline, ok := r.tmpBaselines[containerName]
+	r.tmpBaselineMu.RUnlock()
+	if !ok {
+		return
+	}
+
+	lst, err := r.listContainerTmp(ctx, containerName)
+	if err != nil {
+		log.Printf("%s[WARN]%s restore tmp for %s failed: %v", colorYellow, colorReset, containerName, err)
+		return
+	}
+
+	toRemove := make([]string, 0, len(lst))
+	for _, entry := range lst {
+		if _, keep := baseline[entry]; !keep {
+			toRemove = append(toRemove, path.Join("/tmp", entry))
+		}
+	}
+	if len(toRemove) == 0 {
+		return
+	}
+	args := append([]string{"rm", "-rf"}, toRemove...)
+	if err := r.dockerExec(ctx, containerName, args...); err != nil {
+		log.Printf("%s[WARN]%s cleanup extra tmp entries for %s: %v", colorYellow, colorReset, containerName, err)
+	}
+}
+
+func (r *DockerRunner) listContainerTmp(ctx context.Context, containerName string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, r.dockerBin, "exec", containerName, "ls", "-A", "/tmp")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker exec ls /tmp: %w", err)
+	}
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return nil, nil
+	}
+	entries := strings.Split(trimmed, "\n")
+	return entries, nil
+}
+
+func (r *DockerRunner) copyWorkspaceToContainer(ctx context.Context, hostPath, containerName, containerPath string) error {
+	tarCmd := exec.CommandContext(ctx, "tar", "-C", hostPath, "-cf", "-", ".")
+	tarStdout, err := tarCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("tar workspace: %w", err)
+	}
+	var tarErrBuf bytes.Buffer
+	tarCmd.Stderr = &tarErrBuf
+
+	dockerArgs := []string{"exec", "-i", containerName, "tar", "-C", containerPath, "-xf", "-"}
+	dockerCmd := exec.CommandContext(ctx, r.dockerBin, dockerArgs...)
+	dockerCmd.Stdin = tarStdout
+	var dockerErrBuf bytes.Buffer
+	dockerCmd.Stderr = &dockerErrBuf
+
+	if err := tarCmd.Start(); err != nil {
+		return fmt.Errorf("tar workspace: %w", err)
+	}
+	if err := dockerCmd.Start(); err != nil {
+		_ = tarCmd.Wait()
+		msg := strings.TrimSpace(dockerErrBuf.String())
+		if msg != "" {
+			return fmt.Errorf("stream workspace into container: %w (%s)", err, msg)
+		}
+		return fmt.Errorf("stream workspace into container: %w", err)
+	}
+
+	tarErr := tarCmd.Wait()
+	dockerErr := dockerCmd.Wait()
+	if tarErr != nil {
+		msg := strings.TrimSpace(tarErrBuf.String())
+		if msg != "" {
+			return fmt.Errorf("tar workspace: %w (%s)", tarErr, msg)
+		}
+		return fmt.Errorf("tar workspace: %w", tarErr)
+	}
+	if dockerErr != nil {
+		msg := strings.TrimSpace(dockerErrBuf.String())
+		if msg != "" {
+			return fmt.Errorf("extract workspace in container: %w (%s)", dockerErr, msg)
+		}
+		return fmt.Errorf("extract workspace in container: %w", dockerErr)
+	}
+
+	return nil
+}
+
+func (r *DockerRunner) dockerExec(ctx context.Context, containerName string, args ...string) error {
+	fullArgs := append([]string{"exec", containerName}, args...)
+	cmd := exec.CommandContext(ctx, r.dockerBin, fullArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		trimmed := strings.TrimSpace(string(output))
+		if trimmed != "" {
+			return fmt.Errorf("docker exec %s %v: %w (%s)", containerName, args, err, trimmed)
+		}
+		return fmt.Errorf("docker exec %s %v: %w", containerName, args, err)
+	}
+	return nil
 }
 
 func (r *DockerRunner) allContainerNames() []string {

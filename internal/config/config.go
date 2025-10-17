@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,11 +30,12 @@ type Redis struct {
 }
 
 type Sandbox struct {
-	Container string
-	Languages map[string][]string
-	JobDir    string
-	Docker    Docker
-	Timeout   time.Duration
+	Container       string
+	Languages       map[string][]string
+	JobDir          string
+	ContainerJobDir string
+	Docker          Docker
+	Timeout         time.Duration
 }
 
 type Docker struct {
@@ -63,10 +65,11 @@ func FromEnv() (Config, error) {
 	}
 
 	sandbox := Sandbox{
-		Container: getEnv("SANDBOX_CONTAINER", ""),
-		Languages: langContainers,
-		JobDir:    getEnv("SANDBOX_JOB_DIR", "/tmp/jobs"),
-		Timeout:   getDuration("SANDBOX_TIMEOUT", 3*time.Second),
+		Container:       getEnv("SANDBOX_CONTAINER", ""),
+		Languages:       langContainers,
+		JobDir:          getEnv("SANDBOX_JOB_DIR", filepath.Join(os.TempDir(), "codeportal-jobs")),
+		ContainerJobDir: getEnv("SANDBOX_CONTAINER_JOB_DIR", "/tmp"),
+		Timeout:         getDuration("SANDBOX_TIMEOUT", 3*time.Second),
 		Docker: Docker{
 			Binary:  getEnv("SANDBOX_DOCKER_BIN", "docker"),
 			Network: getEnv("SANDBOX_NETWORK", ""),

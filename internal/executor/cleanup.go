@@ -58,7 +58,7 @@ func (r *DockerRunner) processCleanup(req cleanupRequest) {
 
 	err := os.RemoveAll(req.path)
 	if err == nil || errors.Is(err, fs.ErrNotExist) {
-		log.Printf("%s[CLEAN]%s removed job artifacts at %s", colorMagenta, colorReset, req.path)
+		log.Printf("%s[CLEAN]%s removed staged job artifacts at %s", colorMagenta, colorReset, req.path)
 		return
 	}
 

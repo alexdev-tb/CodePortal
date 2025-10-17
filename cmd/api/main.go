@@ -66,26 +66,27 @@ func main() {
 		Container:          cfg.Sandbox.Container,
 		LanguageContainers: cfg.Sandbox.Languages,
 		JobDir:             cfg.Sandbox.JobDir,
+		ContainerJobDir:    cfg.Sandbox.ContainerJobDir,
 		DockerBinary:       cfg.Sandbox.Docker.Binary,
 		Network:            cfg.Sandbox.Docker.Network,
 		ExecUser:           cfg.Sandbox.Docker.User,
 	})
 	logPoolDetails(runner.PoolSnapshots())
 	execService := executor.NewService(store, runner, cfg.Sandbox.Timeout)
-	
+
 	// Set up authentication service with PostgreSQL
 	userStore, err := auth.NewPostgresStore(db)
 	if err != nil {
 		log.Fatalf("failed to initialize user store: %v", err)
 	}
-	
+
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		jwtSecret = "development-secret-key-change-in-production"
 		log.Printf("%s[AUTH]%s using default JWT secret (change JWT_SECRET env var for production)", colorYellow, colorReset)
 	}
 	authService := auth.NewService(userStore, jwtSecret)
-	
+
 	// Set up handlers
 	apiHandlers := api.NewHandler(execService)
 	authHandlers := auth.NewHandler(authService)
